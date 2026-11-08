@@ -1,0 +1,6 @@
+[project]
+name = "magik-autocomplete"
+description = "Tag autocomplete, related tags and custom text widget support for ComfyUI"
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["aiohttp", "tqdm"]
