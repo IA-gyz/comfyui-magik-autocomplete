@@ -5,7 +5,6 @@ import urllib.error
 import shutil
 import sys
 from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
 from tqdm import tqdm
 
 # --- File Definitions ---
@@ -30,11 +29,13 @@ DEFAULT_CSV_METADATA = {
                     "file_name": "danbooru_tags.csv",
                     "last_download": None,
                     "last_modified_on_hf": None,
+                    "last_seen_modified_on_hf": None,
                 },
                 {
                     "file_name": "danbooru_tags_cooccurrence.csv",
                     "last_download": None,
                     "last_modified_on_hf": None,
+                    "last_seen_modified_on_hf": None,
                 },
             ],
         }
@@ -43,6 +44,9 @@ DEFAULT_CSV_METADATA = {
 
 # --- HuggingFace Constants ---
 HUGGINGFACE_URL = "https://huggingface.co"
+
+# Minimum interval between automatic remote checks for CSV updates.
+REMOTE_CHECK_COOLDOWN = timedelta(hours=24)
 
 
 # --- Helper Functions ---
@@ -59,6 +63,22 @@ def get_temp_download_path(file_name: str) -> str:
 def check_file_valid(file_path):
     """Checks if a file is valid by verifying its existence and size."""
     return os.path.exists(file_path) and os.path.getsize(file_path) > 0
+
+
+def parse_iso8601_utc(value):
+    """
+    Parses an ISO 8601 timestamp (including the 'Z' suffix used by the HuggingFace API)
+    and returns it as a normalized UTC ISO 8601 string, or None if parsing fails.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 class Downloader:
@@ -112,39 +132,42 @@ class Downloader:
         except IOError as e:
             print(f"[Magik Autocomplete] Error saving metadata to {CSV_META_FILE}: {e}")
 
-    def _get_hf_file_last_modified(self, dataset_repo_id: str, hf_filename: str) -> str | None:
+    def _get_hf_dataset_file_last_modified_map(self, dataset_repo_id: str) -> dict:
         """
-        Retrieves the Last-Modified header for a file on HuggingFace and returns it as an ISO 8601 string.
-        hf_filename should be the full filename, e.g., "danbooru_tags.csv".
+        Retrieves per-file lastModified timestamps for a HuggingFace dataset via the tree API
+        (GET /api/datasets/{repo_id}/tree/main). Unlike the CDN-backed Last-Modified header on
+        resolve URLs, these timestamps come from repo metadata and change when a file is updated.
+        Returns a dict mapping file path -> normalized UTC ISO 8601 timestamp string.
+        Returns an empty dict on any error.
         """
-        url = f"{HUGGINGFACE_URL}/datasets/{dataset_repo_id}/resolve/main/{hf_filename}"
+        url = f"{HUGGINGFACE_URL}/api/datasets/{dataset_repo_id}/tree/main"
         try:
             req = urllib.request.Request(
                 url,
-                method="HEAD",
-                headers={"User-Agent": "ComfyUI-Autocomplete-Plus (Python urllib)"},
+                headers={
+                    "User-Agent": "ComfyUI-Autocomplete-Plus (Python urllib)",
+                    "Accept": "application/json",
+                },
             )
             with urllib.request.urlopen(req, timeout=10) as response:
-                last_modified_http = response.getheader("Last-Modified")
-                if last_modified_http:
-                    dt_object = parsedate_to_datetime(last_modified_http)
-                    if dt_object.tzinfo is None or dt_object.tzinfo.utcoffset(dt_object) is None:
-                        dt_object = dt_object.replace(tzinfo=timezone.utc)
-                    else:
-                        dt_object = dt_object.astimezone(timezone.utc)
-                    return dt_object.isoformat()
-                else:
-                    print(f"[Magik Autocomplete] 'Last-Modified' header not found for {hf_filename} at {url}")
-                    return None
+                entries = json.loads(response.read().decode("utf-8"))
+
+            timestamps = {}
+            for entry in entries:
+                if entry.get("type") != "file":
+                    continue
+                path = entry.get("path")
+                normalized = parse_iso8601_utc(entry.get("lastModified"))
+                if path and normalized:
+                    timestamps[path] = normalized
+            return timestamps
         except urllib.error.HTTPError as e:
-            print(f"[Magik Autocomplete] HTTP error when checking last modified for {hf_filename}: {e.code} {e.reason}")
-            return None
-        except (urllib.error.URLError, TimeoutError) as e:
-            print(f"[Magik Autocomplete] URL or network error when checking last modified for {hf_filename}: {e}")
-            return None
+            print(f"[Magik Autocomplete] HTTP error when listing files for dataset {dataset_repo_id}: {e.code} {e.reason}")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"[Magik Autocomplete] Network or parse error when listing files for dataset {dataset_repo_id}: {e}")
         except Exception as e:
-            print(f"[Magik Autocomplete] Unexpected error when checking last modified for {hf_filename}: {e}")
-            return None
+            print(f"[Magik Autocomplete] Unexpected error when listing files for dataset {dataset_repo_id}: {e}")
+        return {}
 
     def _download_file_with_progress_sync(self, hf_dataset_id, file_name: str, metadata_entry: dict):
         """
@@ -233,35 +256,46 @@ class Downloader:
         os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 
+    def _remote_check_cooldown_expired(self, dataset_meta: dict, now_utc: datetime) -> bool:
+        """Returns True if no remote check has been attempted within REMOTE_CHECK_COOLDOWN."""
+        last_check = parse_iso8601_utc(dataset_meta.get("last_remote_check_timestamp"))
+        if not last_check:
+            return True
+        return (now_utc - datetime.fromisoformat(last_check)) >= REMOTE_CHECK_COOLDOWN
+
     def _check_new_csv_from_hf_dataset(self, dataset_meta: dict, now_utc: datetime, force_check: bool = False):
         """Checks HuggingFace for file updates and updates metadata."""
-        perform_hf_check = force_check
+        perform_hf_check = force_check or self._remote_check_cooldown_expired(dataset_meta, now_utc)
 
         if perform_hf_check:
             huggingface_dataset_id = dataset_meta["hf_dataset_id"]
 
             print(f"[Magik Autocomplete] Checking HuggingFace dataset {huggingface_dataset_id} for file updates...")
-            updated_all_hf_timestamps_successfully = True
+            # Record the attempt (not only successes) so an unreachable network does not
+            # add a timeout to every startup; force_check bypasses the cooldown anyway.
+            dataset_meta["last_remote_check_timestamp"] = now_utc.isoformat()
+
+            file_timestamps = self._get_hf_dataset_file_last_modified_map(huggingface_dataset_id)
             for file_meta_info in dataset_meta["csv_files"]:
                 file_name_from_meta = file_meta_info.get("file_name")
                 if not file_name_from_meta:
                     print("[Magik Autocomplete] Warning: file_name missing in csv_files metadata entry.")
-                    updated_all_hf_timestamps_successfully = False
                     continue
 
-                last_modified = self._get_hf_file_last_modified(huggingface_dataset_id, file_name_from_meta)
+                last_modified = file_timestamps.get(file_name_from_meta)
                 if last_modified:
                     file_meta_info["last_modified_on_hf"] = last_modified
                 else:
-                    updated_all_hf_timestamps_successfully = False
-                    print(f"[Magik Autocomplete] Failed to get remote last modified time for {file_name_from_meta}.")
+                    print(f"[Magik Autocomplete] No lastModified found for {file_name_from_meta} in dataset {huggingface_dataset_id}.")
 
-            if updated_all_hf_timestamps_successfully:
-                dataset_meta["last_remote_check_timestamp"] = now_utc.isoformat()
-            else:
-                print(
-                    "[Magik Autocomplete] Could not update all remote timestamps from HuggingFace. Will try again later."
-                )
+    def _record_seen_remote_timestamps(self, dataset_meta: dict):
+        """
+        Marks the currently known remote timestamps as seen. Called after downloads so that
+        unchanged remote files are not re-downloaded on later runs.
+        """
+        for file_meta_info in dataset_meta.get("csv_files", []):
+            if file_meta_info.get("last_modified_on_hf"):
+                file_meta_info["last_seen_modified_on_hf"] = file_meta_info["last_modified_on_hf"]
 
     def _download_csv_files_if_needed(self, dataset_meta: dict):
         """Downloads CSV files if they are missing, outdated, or previously failed."""
@@ -293,17 +327,19 @@ class Downloader:
         if not check_file_valid(local_file_path):
             return f"File {file_name} is missing or empty locally."
 
-        # Check if the last modified date on HuggingFace is newer than the last download date
-        # Temporarily comment out until changes to remote files can be detected
-        # try:
-        #     last_download_dt = datetime.fromisoformat(file_meta_entry["last_download"])
-        #     hf_modified_dt = datetime.fromisoformat(file_meta_entry["last_modified_on_hf"])
-        #     if hf_modified_dt > last_download_dt:
-        #         return f"Remote file {file_name} is newer (HF: {hf_modified_dt}, Local Download: {last_download_dt})."
-        # except (ValueError, TypeError):
-        #     file_meta_entry["last_download"] = None
-        #     file_meta_entry["last_modified_on_hf"] = None
-        #     return f"Invalid timestamp format for {file_name}. Forcing download to ensure integrity."
+        # If the remote file's lastModified changed since the previous check and is newer
+        # than the local download, the file needs to be downloaded again. Comparing against
+        # last_seen_modified_on_hf (recorded after each check) prevents re-downloading when
+        # the remote timestamp is unchanged or bogus.
+        raw_hf_modified = file_meta_entry.get("last_modified_on_hf")
+        hf_modified = parse_iso8601_utc(raw_hf_modified)
+        if hf_modified and raw_hf_modified != file_meta_entry.get("last_seen_modified_on_hf"):
+            raw_last_download = file_meta_entry.get("last_download")
+            last_download = parse_iso8601_utc(raw_last_download)
+            if not last_download:
+                return f"Remote file {file_name} changed on HuggingFace (HF: {raw_hf_modified}) and no local download is recorded."
+            if datetime.fromisoformat(hf_modified) > datetime.fromisoformat(last_download):
+                return f"Remote file {file_name} is newer (HF: {raw_hf_modified}, local download: {raw_last_download})."
 
         # If the file is missing or empty, but the last download timestamp exists, we need to retry.
         if not check_file_valid(local_file_path) and file_meta_entry.get("last_download") is not None:
@@ -318,6 +354,7 @@ class Downloader:
 
         Args:
             force_check: If True, forces a check of HuggingFace regardless of the last check timestamp.
+                Otherwise the remote check runs at most once per REMOTE_CHECK_COOLDOWN.
         """
         # If check_updates_on_startup is False and force_check is not set, skip the check
         if not (self.metadata.get("check_updates_on_startup", True) or force_check):
@@ -330,5 +367,6 @@ class Downloader:
         for dataset_meta in datasets_meta:
             self._check_new_csv_from_hf_dataset(dataset_meta, now_utc, force_check)
             self._download_csv_files_if_needed(dataset_meta)
+            self._record_seen_remote_timestamps(dataset_meta)
 
         self._save_metadata()
